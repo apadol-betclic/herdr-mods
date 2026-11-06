@@ -1,0 +1,7 @@
+{
+  "global": {
+    "cmd-shift-g": "my-tabs.changes",
+    "cmd-shift-u": "my-tabs.pull-requests",
+    "cmd-shift-e": "my-tabs.run"
+  }
+}

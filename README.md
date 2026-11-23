@@ -5,11 +5,11 @@ The type files (`gpui-kit.d.ts`) are not included: herdr-app writes them again.
 
 | Feature | Mod | Notes |
 |---|---|---|
-| Changes panel (GitHub-style review, Viewed, `x`, comments, discard) | `mods/my-changes` | clone of the shipped `changes` |
+| Changes panel (GitHub-style review, Viewed, `x`, comments, discard, stage a folder, copy a file path) | `mods/my-changes` | clone of the shipped `changes` |
 | Run panel (pick an app and a simulator, `flutter run`) | `mods/run-menu` | opened from the "▶ Run" button in `my-tabs` |
 | Tab bar buttons Run / Changes / Pull requests | `mods/my-tabs` | clone of `tabs` |
 | CPU and memory indicators, keep-awake | `mods/my-status` | clone of `workspace-status` |
-| Spaces and worktrees: PR colours, CI spinner, reviewers, simulator runs with build timer, drag and drop | `mods/my-spaces` | clone of `spaces` |
+| Spaces and worktrees: PR colours, CI spinner, reviewer states (approved, dismissed approval, changes requested), simulator runs with build timer, drag and drop | `mods/my-spaces` | clone of `spaces` |
 
 `layouts/mine.json` is the layout that places these mods. `keys.json` holds only the shortcuts for them.
 

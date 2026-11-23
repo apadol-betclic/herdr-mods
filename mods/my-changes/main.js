@@ -142,6 +142,7 @@ export default class Changes extends View {
       this.layout(); cx.notify();
     });
     this.stagePending = new Map(); this.stageQueue = []; this.stageGen = 0;
+    this.discardGen = 0; this.discarded = new Set(); // paths discarded since the running refresh began
     this.focusPath = null; // a file clicked last; scrolling hands focus back to the one at the top
     cx.spawn(async () => { for (;;) if ((await nextCommand()) === "focus") this.handle.focus(); });
     this.refresh(cx);
@@ -158,15 +159,19 @@ export default class Changes extends View {
   watch(root, cx) {
     if (this.on || this.watched === root) return;
     this.watched = root;
+    this.watchPending?.cancel();
+    let current = (this.watchPending = watchFolder(root));
     cx.spawn(async (cx) => {
       try {
-        while (this.watched === root) {
-          const changed = await watchFolder(root);
+        for (;;) {
+          const changed = await current;
+          if (this.watchPending !== current || this.watched !== root) return;
           // Tools write under these all the time (the Dart analyzer, builds); none of it is a change to review.
-          if (!changed.some((p) => !IGNORED.test(p))) continue;
-          if (this.watched === root) this.refresh(cx);
+          if (changed.some((p) => !IGNORED.test(p))) this.refresh(cx);
+          if (this.watchPending !== current || this.watched !== root) return;
+          current = this.watchPending = watchFolder(root);
         }
-      } catch { this.watched = null; }
+      } catch { if (this.watchPending === current) { this.watched = null; this.watchPending = null; } }
     });
   }
 
@@ -186,11 +191,12 @@ export default class Changes extends View {
       const moved = this.place !== key();
       this.context = context; this.place = key(); this.root = null; this.files = []; this.order = []; this.rows = []; this.treeRows = []; this.sel = null; this.sig = null;
       this.error = null; this.note = null; this.watched = null; this.limited = false; this.offset = 0;
+      this.watchPending?.cancel(); this.watchPending = null;
       if (moved) { this.message = ""; this.input.set_value(""); }
     }
     if (!cwd) return;
     this.loading = true; this.loadingSince = Date.now(); this.step = "git rev-parse";
-    const run = (this.run = {}), stageGen = this.stageGen;
+    const run = (this.run = {}), stageGen = this.stageGen, discardGen = this.discardGen;
     cx.spawn(async (cx) => {
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
@@ -265,6 +271,12 @@ export default class Changes extends View {
           await cx.sleep(0);
         }
         if (this.ctx() !== context || this.run !== run) return;
+        // A discard while this ran: its git status may predate it, so those files stay gone and one
+        // more refresh follows.
+        if (this.discardGen !== discardGen) {
+          this.again = true;
+          for (let i = files.length - 1; i >= 0; i--) if (this.discarded.has(files[i].path)) files.splice(i, 1);
+        } else this.discarded.clear();
         // A file staged or unstaged while this ran: git status may predate it, so its flags stay as
         // the checkbox shows them, and one more refresh follows.
         const raced = this.stageGen !== stageGen;
@@ -459,7 +471,25 @@ export default class Changes extends View {
     this.stagePending.set(f.path, after);
     Object.assign(f, after);
     this.note = null;
-    this.stageQueue.push({ path: f.path, args, before, root: this.root, on: this.on });
+    this.stageQueue.push({ paths: [f.path], args, before: { [f.path]: before }, root: this.root, on: this.on });
+    if (!this.stageRunning) this.runStageQueue(cx);
+    cx.notify();
+  }
+
+  // Every file under a folder that isn't fully staged yet, in one `git add`.
+  folderToStage(dir) {
+    return this.files.filter((f) => f.path.startsWith(`${dir}/`) && (!f.staged || f.partial) && !this.stagePending.has(f.path));
+  }
+
+  stageFolder(dir, cx) {
+    this.menu = null;
+    const files = this.folderToStage(dir);
+    if (!this.root || this.busy || !files.length) return cx.notify();
+    const before = {}, after = { staged: true, partial: false };
+    for (const f of files) { before[f.path] = { staged: f.staged, partial: f.partial }; this.stagePending.set(f.path, after); Object.assign(f, after); }
+    const paths = files.map((f) => f.path);
+    this.note = null;
+    this.stageQueue.push({ paths, args: ["add", "-A", "--", ...paths], before, root: this.root, on: this.on, label: `${dir}/` });
     if (!this.stageRunning) this.runStageQueue(cx);
     cx.notify();
   }
@@ -475,12 +505,14 @@ export default class Changes extends View {
           if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
         } catch (e) {
           ok = false;
-          this.note = `Couldn't ${job.args[0] === "add" ? "stage" : "unstage"} ${job.path}: ${e}`;
+          this.note = `Couldn't ${job.args[0] === "add" ? "stage" : "unstage"} ${job.label ?? job.paths[0]}: ${e}`;
         }
-        this.stagePending.delete(job.path);
+        for (const path of job.paths) {
+          this.stagePending.delete(path);
+          const f = job.root === this.root ? this.files.find((o) => o.path === path) : null;
+          if (f && !ok) Object.assign(f, job.before[path]);
+        }
         this.stageGen++;
-        const f = job.root === this.root ? this.files.find((o) => o.path === job.path) : null;
-        if (f && !ok) Object.assign(f, job.before);
         cx.notify();
       }
       this.stageRunning = false;
@@ -490,20 +522,49 @@ export default class Changes extends View {
   // Back to HEAD, both staged and unstaged changes; a file HEAD doesn't have is deleted (out of the
   // index too when it was added). Decided from git at the time, not from the list, which can be old.
   discard(f, cx) {
-    const root = this.root, on = this.on, path = f.path;
+    this.discardPaths([f.path], f.path, cx);
+  }
+
+  // Every changed file under a folder that no stage is running for.
+  folderToDiscard(dir) {
+    return this.files.filter((f) => f.path.startsWith(`${dir}/`) && !this.stagePending.has(f.path));
+  }
+
+  discardPaths(paths, label, cx) {
+    const root = this.root, on = this.on;
     this.menu = null;
-    if (!root || this.busy || this.stagePending.has(path)) return;
+    paths = paths.filter((p) => !this.stagePending.has(p));
+    if (!root || this.busy || !paths.length) return cx.notify();
     this.note = null;
     cx.spawn(async (cx) => {
       const git = (args) => exec("git", args, { cwd: root, on });
+      const names = async (args) => { const r = await git(args); return new Set(r.code === 0 ? r.stdout.split("\0").filter(Boolean) : []); };
       try {
-        let r;
-        if ((await git(["cat-file", "-e", `HEAD:${path}`])).code === 0) r = await git(["restore", "--source=HEAD", "--staged", "--worktree", "--", path]);
-        else if ((await git(["ls-files", "--error-unmatch", "--", path])).code === 0) r = await git(["rm", "-f", "-q", "--", path]);
-        else r = await git(["clean", "-f", "-q", "--", path]);
-        if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+        const inHead = await names(["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", ...paths]);
+        const inIndex = await names(["ls-files", "-z", "--", ...paths]);
+        const restore = paths.filter((p) => inHead.has(p));
+        const remove = paths.filter((p) => !inHead.has(p) && inIndex.has(p));
+        const clean = paths.filter((p) => !inHead.has(p) && !inIndex.has(p));
+        const steps = [];
+        if (restore.length) steps.push(["restore", "--source=HEAD", "--staged", "--worktree", "--", ...restore]);
+        if (remove.length) steps.push(["rm", "-f", "-q", "--", ...remove]);
+        if (clean.length) steps.push(["clean", "-f", "-q", "--", ...clean]);
+        for (const args of steps) {
+          const r = await git(args);
+          if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+        }
+        // Back to HEAD means no change left: they go from the list now, not after git status
+        // (seconds on a large repo) in the refresh that confirms it.
+        if (root === this.root) {
+          const gone = new Set(paths);
+          for (const p of paths) this.discarded.add(p);
+          this.discardGen++;
+          this.files = this.files.filter((f) => !gone.has(f.path));
+          this.sig = null;
+          this.layout();
+        }
       } catch (e) {
-        this.note = `Couldn't discard ${path}: ${e.message ?? e}`;
+        this.note = `Couldn't discard ${label}: ${e.message ?? e}`;
       }
       this.refresh(cx);
       cx.notify();
@@ -514,10 +575,33 @@ export default class Changes extends View {
   fileMenu(t, gh) {
     const m = this.menu;
     if (!m || m.pending) return null;
-    const f = m.f, name = f.path.split("/").pop(), fresh = f.status === "A";
-    const close = (cx) => { this.menu = null; cx.notify(); };
     const item = (id, label, color, action) => div().id(id).h(28).px(10).flex().items_center().rounded(6).cursor_pointer()
       .text_color(color).hover((s) => s.bg(t.hover)).on_click((_e, cx) => action(cx)).child(label);
+    if (m.dir) {
+      const n = this.folderToStage(m.dir).length, gone = this.folderToDiscard(m.dir);
+      const fresh = gone.filter((f) => f.status === "A").length, plural = (k) => `${k} file${k === 1 ? "" : "s"}`;
+      const close = (cx) => { this.menu = null; cx.notify(); };
+      const box = v_flex().id("folder-menu").absolute().left(m.x).top(m.y).w(m.confirm ? 300 : 220).p(4).rounded(8)
+        .bg(t.raised).border_1().border_color(t.border).shadow_lg().text_size(12.5)
+        .on_mouse_down_out((_e, cx) => close(cx))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation());
+      if (!m.confirm) return box
+        .child(n ? item("menu-stage-folder", `Stage ${plural(n)} in folder`, t.foreground, (cx) => this.stageFolder(m.dir, cx))
+          : div().h(28).px(10).flex().items_center().text_color(t.dim).child("Everything here is staged"))
+        .when(gone.length > 0, (e) => e.child(item("menu-discard-folder", `Discard changes in folder…`, gh.deleted, (cx) => { m.confirm = true; cx.notify(); })));
+      return box.p(12).gap(10)
+        .child(div().font_semibold().text_color(t.foreground).child(`Discard all changes to ${plural(gone.length)} in ${m.dir.split("/").pop()}/?`))
+        .child(div().text_size(12).text_color(t.muted).child(
+          `Staged and unstaged changes are lost; files go back to the last commit.${fresh ? ` ${fresh === 1 ? "1 new file is" : `${fresh} new files are`} deleted.` : ""} This can't be undone.`))
+        .child(h_flex().gap(8).justify_end()
+          .child(div().id("discard-folder-cancel").h(28).px(12).flex().items_center().rounded(6).border_1().border_color(t.border).cursor_pointer()
+            .text_color(t.foreground).hover((s) => s.bg(t.hover)).on_click((_e, cx) => close(cx)).child("Cancel"))
+          .child(div().id("discard-folder-confirm").h(28).px(12).flex().items_center().rounded(6).cursor_pointer()
+            .bg(gh.deleted).text_color("#ffffff").font_semibold().on_click((_e, cx) => this.discardPaths(gone.map((f) => f.path), `${m.dir}/`, cx))
+            .child("Discard")));
+    }
+    const f = m.f, name = f.path.split("/").pop(), fresh = f.status === "A";
+    const close = (cx) => { this.menu = null; cx.notify(); };
     const box = v_flex().id("file-menu").absolute().left(m.x).top(m.y).w(m.confirm ? 300 : 200).p(4).rounded(8)
       .bg(t.raised).border_1().border_color(t.border).shadow_lg().text_size(12.5)
       .on_mouse_down_out((_e, cx) => close(cx))
@@ -726,7 +810,8 @@ export default class Changes extends View {
           .child({ A: "new", D: "deleted", U: "conflict" }[f.status])))
         .child(div().flex().flex_row().items_center().flex_1().min_w(0).font_family(this.code).text_size(12)
           .child(div().flex_shrink(1).min_w(0).truncate().text_color(t.muted).child(parts.length ? `${parts.join("/")}/` : ""))
-          .child(div().flex_none().font_semibold().text_color(t.foreground).child(name)))
+          .child(div().flex_none().font_semibold().text_color(t.foreground).child(name))
+          .child(this.copyPathButton(f, t, gh, pre)))
         // Fixed widths: rows are sized by hand (see rowWidth).
         .when(count > 0, (e) => e.child(div().w(88).flex_none().text_center().rounded(9).bg(gh.viewed + "33").text_size(11).text_color(t.foreground).child(`${count} comment${count === 1 ? "" : "s"}`)))
         .when(Boolean(f.staged), (e) => e.child(div().w(56).flex_none().text_center().rounded(4).border_1().border_color(gh.added).text_size(10.5).text_color(gh.added)
@@ -744,6 +829,22 @@ export default class Changes extends View {
           .border_color(viewed ? gh.viewed : t.border).bg(viewed ? gh.viewed + "26" : t.background)
           .text_size(12).text_color(viewed ? t.foreground : t.muted)
           .child(viewed ? "✓ Viewed" : "☐ Viewed"));
+  }
+
+  // GitHub's copy icon after the file name: copies the path from the repo root, a check shows for a moment.
+  copyPathButton(f, t, gh, pre) {
+    const copied = this.copiedPath === f.path;
+    return div().id(`${pre}copy|${f.path}`).ml(6).size(22).flex_none().flex().items_center().justify_center().rounded(4)
+      .hover((s) => s.bg(t.hover))
+      .tooltip(copied ? "Copied" : "Copy the path")
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        cx.write_to_clipboard(f.path);
+        this.copiedPath = f.path;
+        cx.timer.after(1500, (cx) => { if (this.copiedPath === f.path) { this.copiedPath = null; cx.notify(); } });
+        cx.notify();
+      })
+      .child(svg(copied ? "mods/workspace-chrome/check.svg" : "mods/my-changes/copy.svg").size(14).text_color(copied ? gh.added : t.muted));
   }
 
   commentRow(row, t, gh) {
@@ -862,6 +963,7 @@ export default class Changes extends View {
       return h_flex().id(`dir-${r.full}`).h(26).flex_none().pl(pad).pr(8).gap(6).items_center().rounded(6).text_color(t.muted)
         .hover((s) => s.bg(t.hover)).cursor_pointer()
         .on_click((_e, cx) => { open ? this.treeFolded.add(r.full) : this.treeFolded.delete(r.full); this.layout(); cx.notify(); })
+        .when(this.mode !== "branch", (e) => e.on_mouse_down("right", () => { this.menu = { dir: r.full, pending: true }; }))
         .child(svg(`mods/files/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none())
         .child(svg("mods/files/folder.svg").size(14).flex_none())
         .child(div().flex_1().min_w(0).truncate().child(r.label));
@@ -947,7 +1049,7 @@ export default class Changes extends View {
         if (!this.menu?.pending) return;
         const z = this.zoom ?? 1, x = (e.local_position?.x ?? 0) / z, y = (e.local_position?.y ?? 0) / z;
         const w = (e.bounds?.width ?? Infinity) / z, h = (e.bounds?.height ?? Infinity) / z;
-        this.menu = { f: this.menu.f, x: Math.max(4, Math.min(x, w - 304)), y: Math.max(4, Math.min(y, h - 150)) };
+        this.menu = { f: this.menu.f, dir: this.menu.dir, x: Math.max(4, Math.min(x, w - 304)), y: Math.max(4, Math.min(y, h - 150)) };
         cx.notify();
       })
       .on_key_down((e, cx) => {

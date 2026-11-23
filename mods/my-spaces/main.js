@@ -5,7 +5,10 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { spaces, machines, panes, terminals, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+// The "working" loader: braille dots, drawn natively (no redraw of the window).
+const BRAILLE = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const loader = (t) => div().size(12).flex_none().flex().items_center().justify_center().text_size(12).text_color(t.working).frames(BRAILLE, 80);
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -106,7 +109,7 @@ export default class Spaces extends View {
     this.busy = {}; // pane -> an agent working or a program in front of its shell
     this.ready = {}; // machine -> its layout was readable at the last look
     this.at = {}; // space -> its where() at the last look
-    this.watching = new Set(); // local repos' git folders
+    this.watching = new Map(); // local repos' pending folder watches
     // Spaces made while this runs wait (at most a moment) for their git, so a
     // worktree appears under its repo instead of jumping there.
     this.shown = new Set(spaces().map((s) => s.id));
@@ -114,7 +117,7 @@ export default class Spaces extends View {
     this.drag = null;
     this.machines = [];
     this.folded = new Set(JSON.parse(localStorage.getItem("machines.folded") ?? "[]"));
-    this.prs = {}; // prKey() -> "none" | "open" | "failing" | "queued" | "merged"
+    this.prs = {}; // prKey() -> "none" | "draft" | "open" | "failing" | "queued" | "merged"
     this.prsAt = 0;
     this.ci = {}; // prKey() -> names of the watched CI runs going on it
     this.reviewable = {}; // prKey() -> { folder, number } of an open pull request with green CI, out of the merge queue
@@ -149,10 +152,9 @@ export default class Spaces extends View {
       try {
         const ps = panes().filter((p) => p.terminal && /^dart(vm)?$/.test(p.program?.name ?? ""));
         const sp = spaces();
+        const live = new Map(terminals().map((x) => [x.address, x]));
         for (const p of ps) {
-          const r = await hc(["get", p.terminal, "--json"]);
-          if (r.code !== 0) continue;
-          const fg = JSON.parse(r.stdout).foreground;
+          const fg = live.get(p.terminal)?.foreground;
           const argv = fg?.argv ?? [], at = argv.findIndex((a) => /flutter_tools\.snapshot$/.test(a));
           if (at < 0 || argv[at + 1] !== "run") continue;
           const space = sp.find((w) => (w.tabs ?? []).some((c) => c.id === p.tab));
@@ -208,7 +210,7 @@ export default class Spaces extends View {
         .child(clock((x.ready ?? Date.now()) - x.start)))
       .child(x.running
         ? div().size(6).mr(4).rounded(3).flex_none().bg(t.ansi2)
-        : svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900));
+        : loader(t));
   }
 
   // From the space's avatar (or a worktree's branch mark) down to its first run line.
@@ -285,7 +287,7 @@ export default class Spaces extends View {
         for (const key of keys) await this.check(key, cx);
       }
       const used = new Set(Object.values(this.git).filter(Boolean).map((g) => JSON.parse(g.repo)).filter(([on]) => !on).map(([, repo]) => repo));
-      for (const repo of this.watching) if (!used.has(repo)) this.watching.delete(repo);
+      for (const [repo, pending] of this.watching) if (!used.has(repo)) { this.watching.delete(repo); pending.cancel(); }
       this.refreshing = false;
       cx.notify();
     });
@@ -360,7 +362,7 @@ export default class Spaces extends View {
     if (!slug) return;
     const [owner, name] = slug.split("/");
     // A closed, unmerged PR counts as none; the newest PR of the branch wins.
-    const fields = branches.map((b, i) => `b${i}: pullRequests(headRefName: ${JSON.stringify(b)}, first: 1, states: [OPEN, MERGED], orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number state isInMergeQueue mergeable commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { ... on CheckRun { name status conclusion startedAt checkSuite { workflowRun { workflow { name } } } } ... on StatusContext { context state } } } } } } } } }`);
+    const fields = branches.map((b, i) => `b${i}: pullRequests(headRefName: ${JSON.stringify(b)}, first: 1, states: [OPEN, MERGED], orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number state isDraft isInMergeQueue mergeable commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { ... on CheckRun { name status conclusion startedAt checkSuite { workflowRun { workflow { name } } } } ... on StatusContext { context state } } } } } } } } }`);
     const query = `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { ${fields.join(" ")} } }`;
     const r = await exec("gh", ["api", "graphql", "-f", `query=${query}`], { cwd: folder });
     if (r.code !== 0) return;
@@ -375,10 +377,11 @@ export default class Spaces extends View {
         : pr.state === "MERGED" ? "merged"
         : pr.isInMergeQueue ? "queued"
         : pr.mergeable === "CONFLICTING" || failing(rollup?.contexts?.nodes ?? []) ? "failing"
+        : pr.isDraft ? "draft"
         : "open";
       const key = prKey({ repo, branch });
       const validating = going.includes(CI_CHECKS.validate_pull_request);
-      if (pr?.state === "OPEN" && !pr.isInMergeQueue && !validating && green(rollup?.contexts?.nodes ?? [])) {
+      if (pr?.state === "OPEN" && !pr.isDraft && !pr.isInMergeQueue && !validating && green(rollup?.contexts?.nodes ?? [])) {
         if (this.reviewable[key]?.number !== pr.number) delete this.reviewsAt[key];
         this.reviewable[key] = { folder, number: pr.number };
       } else delete this.reviewable[key];
@@ -401,14 +404,14 @@ export default class Spaces extends View {
   }
 
   // As GitHub's Reviewers box: requested reviewers first (awaiting), then anyone else who left
-  // a review. Teams, bots and the author are left out. Approved: their last
-  // approve/request-changes/dismiss is an approval.
+  // a review. Teams, bots and the author are left out. State: their last approve/request-changes/
+  // dismiss. A push dismisses approvals: "stale" until they approve again.
   async fetchReviews(folder, keys) {
     const slug = this.slugs[folder];
     if (!slug) return;
     const [owner, name] = slug.split("/");
     const who = "author { __typename login ... on User { name } }";
-    const fields = keys.map((k, i) => `p${i}: pullRequest(number: ${this.reviewable[k].number}) { author { login } reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login name } } } } reviews(last: 100) { nodes { state ${who} } } }`);
+    const fields = keys.map((k, i) => `p${i}: pullRequest(number: ${this.reviewable[k].number}) { author { login } reviewRequests(first: 20) { nodes { requestedReviewer { __typename ... on User { login name } } } } reviews(last: 100) { nodes { id state ${who} } } timelineItems(last: 100, itemTypes: [REVIEW_DISMISSED_EVENT]) { nodes { ... on ReviewDismissedEvent { previousReviewState review { id } } } } }`);
     const query = `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { ${fields.join(" ")} } }`;
     const r = await exec("gh", ["api", "graphql", "-f", `query=${query}`], { cwd: folder });
     if (r.code !== 0) return;
@@ -419,14 +422,17 @@ export default class Spaces extends View {
       const people = new Map();
       const person = (a) => {
         if (!a?.login || a.__typename === "Bot" || /\[bot\]$/.test(a.login ?? "") || a.login === pr.author?.login) return null;
-        if (!people.has(a.login)) people.set(a.login, { name: a.name || a.login, approved: false, awaiting: false });
+        if (!people.has(a.login)) people.set(a.login, { name: a.name || a.login, state: "commented", awaiting: false });
         return people.get(a.login);
       };
       for (const q of pr.reviewRequests?.nodes ?? []) { const p = person(q?.requestedReviewer); if (p) p.awaiting = true; }
+      const was = new Map((pr.timelineItems?.nodes ?? []).filter((e) => e?.review?.id).map((e) => [e.review.id, e.previousReviewState]));
       for (const v of pr.reviews?.nodes ?? []) {
         const p = person(v?.author);
         if (!p) continue;
-        if (["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(v.state)) p.approved = v.state === "APPROVED";
+        if (v.state === "APPROVED") p.state = "approved";
+        else if (v.state === "CHANGES_REQUESTED") p.state = "changes";
+        else if (v.state === "DISMISSED") p.state = was.get(v.id) === "APPROVED" ? "stale" : "commented";
       }
       this.reviews[k] = [...people.values()];
     });
@@ -441,15 +447,18 @@ export default class Spaces extends View {
   }
 
   // A reviewer's line, under the worktree's name: the name, then a clock while their review is
-  // awaited (requested, or requested again), else a check once they approved, else a bubble.
+  // awaited (requested, or requested again), else their review state.
   reviewerRow(r, x, n, t) {
     const icon = (file, color) => svg(file).size(12).flex_none().text_color(color);
+    const [file, color, tip] = x.awaiting ? ["mods/workspace-chrome/clock.svg", t.dim, "Review requested"]
+      : x.state === "approved" ? ["mods/workspace-chrome/check.svg", t.ansi2, "Approved"]
+      : x.state === "stale" ? ["mods/workspace-chrome/check.svg", t.ansi3, "Approved before the last push: approval dismissed"]
+      : x.state === "changes" ? ["mods/workspace-chrome/x.svg", t.ansi1, "Changes requested"]
+      : ["mods/my-spaces/message.svg", t.ansi4, "Commented"];
     return h_flex().id(`reviewer-${r.w.id}-${n}`).h(REVIEW_HEIGHT).flex_none().items_center().gap(6)
-      .pl(44).pr(4).text_size(12).text_color(t.muted)
+      .pl(44).pr(4).text_size(12).text_color(t.muted).tooltip(tip)
       .child(div().min_w(0).truncate().child(x.name))
-      .child(x.awaiting ? icon("mods/workspace-chrome/clock.svg", t.dim)
-        : x.approved ? icon("mods/workspace-chrome/check.svg", t.ansi2)
-        : icon("mods/my-spaces/message.svg", t.ansi4));
+      .child(icon(file, color));
   }
 
   // Branch -> names of the CI_WORKFLOWS runs not finished on it. The newest runs are enough:
@@ -472,21 +481,25 @@ export default class Spaces extends View {
 
   watch(repo, cx) {
     if (this.watching.has(repo)) return;
-    this.watching.add(repo);
+    let current = watchFolder(repo);
+    this.watching.set(repo, current);
     cx.spawn(async (cx) => {
       try {
-        while (this.watching.has(repo)) {
-          await watchFolder(repo);
+        for (;;) {
+          await current;
+          if (this.watching.get(repo) !== current) return;
           const mine = JSON.stringify([null, repo]);
-          if (this.watching.has(repo)) this.refreshGit(Object.keys(this.git).filter((k) => this.git[k]?.repo === mine), cx);
+          this.refreshGit(Object.keys(this.git).filter((k) => this.git[k]?.repo === mine), cx);
+          current = watchFolder(repo);
+          this.watching.set(repo, current);
         }
-      } catch { this.watching.delete(repo); }
+      } catch { if (this.watching.get(repo) === current) this.watching.delete(repo); }
     });
   }
 
   menu(w) {
     // A popup is as tall as its items; height is only the most.
-    openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: w.id } } });
+    openOverlay({ mod: "my-menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: w.id } } });
   }
 
   // Spaces in order, each worktree space moved under its main checkout's.
@@ -584,7 +597,7 @@ export default class Spaces extends View {
 
   prColor(g, t) {
     const state = g?.branch ? this.prs[prKey(g)] : undefined;
-    return { open: t.ansi2, failing: t.ansi1, merged: t.ansi5, queued: "#ffb86c" }[state] ?? t.foreground;
+    return { open: t.ansi2, draft: t.muted, failing: t.ansi1, merged: t.ansi5, queued: "#ffb86c" }[state] ?? t.foreground;
   }
 
   // The thin line from a repo's avatar down to its worktrees: through every row, ending
@@ -700,7 +713,7 @@ export default class Spaces extends View {
   ciLoader(w, g, t) {
     return div().id(`ci-${w.id}`).flex_none().mr(2).flex().items_center()
       .tooltip(`${this.ci[prKey(g)].join(" and ")} running`)
-      .child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900));
+      .child(loader(t));
   }
 
   row(r, t) {

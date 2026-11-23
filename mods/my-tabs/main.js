@@ -1,6 +1,9 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, run, openOverlay, closeOverlay, nextCommand, theme, window, shared, setShared, layout, settings, terminals, exec, home, notify } from "herdr";
+import { spaces, panes, run, openOverlay, closeOverlay, nextCommand, theme, window, shared, setShared, layout, settings, terminals, hc, home, notify } from "herdr";
+// The "working" loader: braille dots, drawn natively (no redraw of the window).
+const BRAILLE = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const loader = (t) => div().size(12).flex_none().flex().items_center().justify_center().text_size(12).text_color(t.working).frames(BRAILLE, 80);
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -47,7 +50,7 @@ function openPullRequests(cx) {
     let address = shared("pullRequests.terminal");
     if (!live(address)) address = terminals().find((t) => t.name === PR_NAME && t.state === "live")?.address;
     if (!live(address)) {
-      const r = await exec("hc", ["run", "--bg", "--json", "--no-parent", "--name", PR_NAME, "--cwd", `${home()}/Git/flutter-front`, "--", "gh", "dash"]).catch((e) => ({ code: 1, stderr: String(e) }));
+      const r = await hc(["run", "--bg", "--json", "--no-parent", "--name", PR_NAME, "--cwd", `${home()}/Git/flutter-front`, "--", "gh", "dash"]).catch((e) => ({ code: 1, stderr: String(e) }));
       address = r.code === 0 ? JSON.parse(r.stdout).address : null;
       if (!address) { notify({ title: "Couldn't start gh dash", body: (r.stderr || r.stdout || "").trim(), level: "error" }); return; }
       setShared("pullRequests.terminal", address);
@@ -102,7 +105,7 @@ export default class Tabs extends View {
     this.counting = true;
     cx.spawn(async (cx) => {
       try {
-        const r = await exec("hc", ["exec", "gh", "api", "-X", "GET", "search/issues", "-f", `q=${REVIEW_QUERY}`, "-f", "per_page=1", "--jq", ".total_count"]);
+        const r = await hc(["exec", "gh", "api", "-X", "GET", "search/issues", "-f", `q=${REVIEW_QUERY}`, "-f", "per_page=1", "--jq", ".total_count"]);
         const n = Number(r.stdout.trim());
         if (r.code === 0 && Number.isInteger(n)) this.reviews = n;
       } catch {}
@@ -161,7 +164,7 @@ export default class Tabs extends View {
         .on_mouse_down("right", () => openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: c.id, space: space.id } } }))
         .when(Boolean(program?.icon), el => el.child(program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)))
         .child(div().max_w(170).truncate().child(c.zoomed ? `${name} Z` : name))
-        .when(c.status === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
+        .when(c.status === "working", el => el.child(loader(t)))
         .when(c.status === "blocked" || c.status === "done", el => el.child(div().size(6).rounded(3).bg(t[c.status])))
         .when(c.active, el => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg("mods/pane/close.svg").size(12))));
     };

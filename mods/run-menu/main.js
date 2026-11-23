@@ -7,6 +7,15 @@ import { v_flex, h_flex } from "gpui-base";
 import { theme, run, exec, props, closeOverlay } from "herdr";
 import * as fs from "fs/promises";
 
+const DEVICE_HUB = "com.apple.dt.Devices";
+
+// "com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4" → "iOS 27.2"
+const osLabel = (runtime) => {
+  const id = runtime.split(".").pop();
+  const m = id.match(/^([A-Za-z]+)-(\d+)-(\d+)/);
+  return m ? `${m[1]} ${m[2]}.${m[3]}` : id;
+};
+
 export default class RunMenu extends View {
   init(_props, cx) {
     this.handle = cx.focus_handle();
@@ -40,7 +49,7 @@ export default class RunMenu extends View {
         const r = await exec("xcrun", ["simctl", "list", "devices", "booted", "-j"]);
         const devices = JSON.parse(r.stdout).devices ?? {};
         const sims = Object.entries(devices).flatMap(([runtime, list]) => list.filter((d) => d.state === "Booted")
-          .map((d) => ({ udid: d.udid, name: d.name, os: runtime.split(".").pop().replace(/^iOS-/, "iOS ").replace(/-/g, ".") })));
+          .map((d) => ({ udid: d.udid, name: d.name, os: osLabel(runtime) })));
         const changed = JSON.stringify(sims) !== JSON.stringify(this.sims);
         this.sims = sims;
         if (changed) cx.notify();
@@ -49,6 +58,19 @@ export default class RunMenu extends View {
       }
       this.loadingSims = false;
     });
+  }
+
+  // Device Hub (Xcode 27+) replaced Simulator.app, which booted the last-used device on launch. Opening
+  // Device Hub is not relied on to do that: boot the most recently used iOS simulator; the 2 s poll lists it.
+  openDeviceHub() {
+    exec("open", ["-b", DEVICE_HUB]).catch(() => {});
+    exec("xcrun", ["simctl", "list", "devices", "available", "-j"]).then((r) => {
+      const last = Object.entries(JSON.parse(r.stdout).devices ?? {})
+        .filter(([runtime]) => /\.iOS-/.test(runtime))
+        .flatMap(([, list]) => list)
+        .sort((a, b) => String(b.lastUsedAt ?? "").localeCompare(String(a.lastUsedAt ?? "")))[0];
+      if (last && last.state !== "Booted") return exec("xcrun", ["simctl", "boot", last.udid]);
+    }).catch(() => {});
   }
 
   pickApp(app, cx) {
@@ -117,6 +139,6 @@ export default class RunMenu extends View {
       // With no simulator: say so on both steps, and offer to start one.
       .when(noSim, (el) => el.child(div().h(1).mx(4).my(5).bg(t.border))
         .child(note(this.simError ? `Couldn't list simulators: ${this.simError}` : "No iOS simulator is running"))
-        .child(this.row("open-simulator", svg("mods/run-menu/phone.svg").size(14).text_color(t.muted), "Open Simulator", "", () => { exec("open", ["-a", "Simulator"]).catch(() => {}); }, t)));
+        .child(this.row("open-device-hub", svg("mods/run-menu/phone.svg").size(14).text_color(t.muted), "Open Device Hub", "", () => this.openDeviceHub(), t)));
   }
 }
